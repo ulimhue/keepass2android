@@ -1,0 +1,121 @@
+name: Build signed APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-signed:
+
+    runs-on: windows-2022
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+
+    - name: Extract key store
+      env:
+        KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        KeyStore: "${{ github.workspace }}/kp2a.keystore"
+      shell: bash
+      run: |
+        echo $KeyStore
+        echo $KEYSTORE_BASE64 | base64 --decode > $KeyStore
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v3
+
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('src/**/*.csproj', 'src/**/packages.config') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-
+
+    # Workaround an issue when building on windows-2022. Error was
+    #       D8 : OpenJDK 64-Bit Server VM warning : INFO: os::commit_memory(0x00000000ae400000, 330301440, 0) failed; error='The paging file is too small for this operation to complete' (DOS error/errno=1455) [D:\a\keepass2android\keepass2android\src\keepass2android\keepass2android-app.csproj]
+    #       C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Xamarin\Android\Xamarin.Android.D8.targets(81,5): error MSB6006: "java.exe" exited with code 1. [D:\a\keepass2android\keepass2android\src\keepass2android\keepass2android-app.csproj]
+    - name: Configure Pagefile
+      uses: al-cheb/configure-pagefile-action@a3b6ebd6b634da88790d9c58d4b37a7f4a7b8708 # v1.4
+      with:
+        minimum-size: 8GB
+
+    - name: Add msbuild/dotnet to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Switch to JDK-17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Display java version
+      run: java -version
+
+    # ------------------------------------------------------------------
+    # Android SDK + NDK (Set NDK to at least 28 to support 16kb page size)
+    # ------------------------------------------------------------------
+    - name: Setup Android SDK & NDK
+      uses: android-actions/setup-android@v3
+      with:
+        packages: |
+          platforms;android-35
+          build-tools;35.0.0
+          ndk;28.2.13676358
+
+    - name: Export NDK environment
+      shell: bash
+      run: |
+        echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/28.2.13676358" >> $GITHUB_ENV
+        echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/28.2.13676358" >> $GITHUB_ENV
+
+    - name: Verify NDK
+      shell: bash
+      run: |
+        echo "NDK root: $ANDROID_NDK_ROOT"
+        ls "$ANDROID_NDK_ROOT"
+        "$ANDROID_NDK_ROOT/ndk-build.cmd" --version
+
+    # ------------------------------------------------------------------
+    # Native / Java build
+    # ------------------------------------------------------------------
+    - name: Build native dependencies
+      shell: cmd
+      run: |
+        make native
+
+    - name: Build java dependencies
+      shell: cmd
+      run: |
+        make java
+
+    - name: Update dotnet workloads
+      run: |
+        dotnet workload update
+        cd src/keepass2android-app
+        dotnet workload restore
+        cd ../..
+
+    - name: Select the manifest
+      run: |
+        make manifestlink Flavor=Net
+
+    - name: Install NuGet dependencies
+      run: make nuget Flavor=Net
+
+    - name: Build APK with signing
+      env:
+        KeyStore: "${{ github.workspace }}/kp2a.keystore"
+        MyAndroidSigningStorePass: ${{ secrets.KEY_STORE_PASSWORD }}
+        MyAndroidSigningKeyPass: ${{ secrets.KEY_PASSWORD }}
+      run: |
+        make apk_split Configuration=Release Flavor=Net
+
+    - name: Archive production artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: keepass2android_signed_net_split
+        path: |
+          src/keepass2android-app/bin/Release/net9.0-android/publish/*.apk
+          src/keepass2android-app/bin/Release/net9.0-android/*/publish/*.apk
